@@ -347,7 +347,7 @@ int AxiDmaController::SGTransmitBlock(const void *data_ptr, uint32_t len)
         return 0; // No free BDs
 
     // Copy user data to the DMA buffer
-    uint64_t buffer_address_virt = (uint64_t)m_mem_region + (channel.head_idx * channel.buffer_size_per_bd);
+    uint64_t buffer_address_virt = virt_tx_buf + (channel.head_idx * channel.buffer_size_per_bd);
     uint64_t bd_address_phys = phys_addr_tx_bd + (channel.head_idx * sizeof(AxiDmaBufferDescriptor));
     void *dma_buffer_virt = (void *)(buffer_address_virt);
     memcpy(dma_buffer_virt, data_ptr, len);

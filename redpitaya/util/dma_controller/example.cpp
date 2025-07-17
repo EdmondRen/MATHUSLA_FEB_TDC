@@ -149,8 +149,7 @@ void run_sg_loopback_test() {
                     // printf("* Error: [%d]: Tx %d, Rx %d*\n",j, (i+j) & 0xFF, rx_data[j]);
                 }
                 else{
-                    printf("* Correct: [%d]: Tx %d, Rx %d*\n",j, (i+j) & 0xFF, rx_data[j]);
-
+                    // printf("* Correct: [%d]: Tx %d, Rx %d*\n",j, (i+j) & 0xFF, rx_data[j]);
                 }
             }
             std::cout << "  Verification: " << (ok ? "PASS" : "FAIL")<< ", total errors "<< total_errors << std::endl;
