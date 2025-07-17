@@ -123,6 +123,14 @@ int dma_wait_for_completion(AxiDmaHandle_t handle, DmaDirection_e dir);
 int dma_get_completed_block(AxiDmaHandle_t handle, DmaDirection_e dir, void** data_ptr, uint32_t* len);
 
 /**
+ * @brief Waits for the next transmit block to complete in SG mode (does not return data pointer or length).
+ * This is a blocking call (polling or interrupt based).
+ * @param handle The DMA handle.
+ * @return 1 if a block was completed, 0 if not, -1 on error.
+ */
+int dma_wait_for_transmit_completion_sg(AxiDmaHandle_t handle);
+
+/**
  * @brief Releases a processed block, making its buffer available to the DMA again.
  * @param handle The DMA handle.
  * @param dir The direction to release the block for.

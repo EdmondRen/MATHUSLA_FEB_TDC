@@ -55,17 +55,25 @@ public:
 
     // --- Control for SG/Cyclic Modes ----
     void initSG(DmaMode mode_mm2s, DmaMode mode_s2mm, uint32_t num_bds, uint32_t buffer_size);
-    // TX
     void startSG(DmaDirection dir);
-    int SGTransmitBlock(const void* data_ptr, uint32_t len);
-    // RX
-    int getCompletedBlock(void** data_ptr, uint32_t* len);
+    // Tx and Rx
+    int sgTransmit(const void* data_ptr, uint32_t len);
+    int sgReceive(void** data_ptr, uint32_t* len);
+    int waitForTransmitCompletionSG();
+
+    // Release
     void releaseBlock(DmaDirection dir);
+
+    // --- SG transmit completion (status only) ---
 
 
 private:
     void waitForCompletion_poll(DmaDirection dir);
     void waitForCompletion_irq(DmaDirection dir);
+
+    // --- Batch SG transmit helpers ---
+    int prepareTransmitBlock(const void* data_ptr, uint32_t len, bool sof, bool eof);
+    void flushTransmit();    
 
     // --- Private Members ---
     DmaWaitMode WAIT_METHOD;
@@ -73,21 +81,23 @@ private:
     int m_uio_mm2s_fd = -1;
     int m_uio_s2mm_fd = -1;
     int m_mem_fd = -1;
-    
-    // Memory mapped regions
-    volatile uint32_t* m_dma_regs = nullptr;
-    volatile uint8_t* m_mem_region = nullptr;
-    uint64_t virt_tx_buf;
-    uint64_t virt_rx_buf;
-    uint64_t m_mem_size;
+
 
     // Physical addresses
     uint64_t m_dma_regs_addr;
     uint64_t m_mem_phys_addr;
+    uint64_t m_mem_size;
+
     uint64_t phys_addr_tx_bd;
     uint64_t phys_addr_tx_buf;    
     uint64_t phys_addr_rx_bd;
     uint64_t phys_addr_rx_buf;
+
+    // Memory mapped regions
+    volatile uint32_t* m_dma_regs = nullptr;
+    volatile uint8_t* m_mem_region = nullptr;
+    uint64_t virt_tx_buf;
+    uint64_t virt_rx_buf;    
 
 
     // Channel-specific state

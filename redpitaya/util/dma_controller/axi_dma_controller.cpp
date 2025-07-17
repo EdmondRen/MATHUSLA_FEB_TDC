@@ -197,11 +197,12 @@ void AxiDmaController::waitForCompletion_poll(DmaDirection dir)
 {
     uint32_t dmasr_offset = (dir == DmaDirection::TRANSMIT) ? MM2S_DMASR : S2MM_DMASR;
     uint32_t status;
-    int count = 0;
+    uint32_t count = 0;
     do
     {
         status = m_dma_regs[dmasr_offset / 4];
-    } while (!(status & DMA_SR_IOC_IRQ_MASK));
+        count ++;
+    } while (!(status & DMA_SR_IOC_IRQ_MASK) && count<0xFFFFFFFF);
 
     m_dma_regs[dmasr_offset / 4] |= DMA_SR_IOC_IRQ_MASK;
 }
@@ -246,9 +247,6 @@ void AxiDmaController::initSG(DmaMode mode_mm2s, DmaMode mode_s2mm, uint32_t num
     // --- Robust memory partitioning for BDs and buffers ---
     // 1. The memory region is divided into two halfs
     // | MM2S BDs --> MM2S buffers | S2MM BDs --> S2MM buffers |
-    // Calculate sizes for both channels
-    size_t mm2s_bd_size = num_bds * sizeof(AxiDmaBufferDescriptor);
-    size_t s2mm_bd_size = num_bds * sizeof(AxiDmaBufferDescriptor);
 
     // MM2S BDs: base
     uint64_t mm2s_bd_base_virt = (uint64_t)m_mem_region;
@@ -295,10 +293,10 @@ void AxiDmaController::setupBdChain(DmaChannel &channel)
         channel.bd_chain[i].status = 0;
         for (int j = 0; j < 5; ++j)
             channel.bd_chain[i].app[j] = 0;
-        std::cout << "  BD[" << i << "] next_desc_ptr=0x" << std::hex << channel.bd_chain[i].next_desc_ptr
-                  << " buffer_addr=0x" << channel.bd_chain[i].buffer_addr
-                  << " control=0x" << channel.bd_chain[i].control
-                  << " status=0x" << channel.bd_chain[i].status << std::dec << std::endl;
+        // std::cout << "  BD[" << i << "] next_desc_ptr=0x" << std::hex << channel.bd_chain[i].next_desc_ptr
+        //           << " buffer_addr=0x" << channel.bd_chain[i].buffer_addr
+        //           << " control=0x" << channel.bd_chain[i].control
+        //           << " status=0x" << channel.bd_chain[i].status << std::dec << std::endl;
     }
 }
 
@@ -325,7 +323,7 @@ void AxiDmaController::startSG(DmaDirection dir)
             cr_val |= DMA_CR_CYCLIC_EN_MASK;
         m_dma_regs[curdesc_offset / 4] = channel.bd_chain_phys_addr & 0xFFFFFFFF;
         m_dma_regs[cr_offset / 4] = cr_val;
-        m_dma_regs[taildesc_offset / 4] = channel.bd_chain_phys_addr + (channel.num_bds - 1) * sizeof(AxiDmaBufferDescriptor);
+        // m_dma_regs[taildesc_offset / 4] = channel.bd_chain_phys_addr + (channel.num_bds - 1) * sizeof(AxiDmaBufferDescriptor);
         // std::cout<<std::hex<< m_dma_regs[cr_offset / 4]<<std::endl;
         // std::cout<<std::hex<< m_dma_regs[curdesc_offset / 4]<<","<<std::hex<< (channel.bd_chain_phys_addr & 0xFFFFFFFF)<<std::endl;
         // std::cout<<std::hex<< m_dma_regs[taildesc_offset / 4]<<std::endl;
@@ -336,68 +334,101 @@ void AxiDmaController::startSG(DmaDirection dir)
 
 }
 
-int AxiDmaController::SGTransmitBlock(const void *data_ptr, uint32_t len)
-{
+int AxiDmaController::sgTransmit(const void *data_ptr, uint32_t len) {
     DmaChannel &channel = m_mm2s_channel;
     if (channel.mode != DmaMode::SCATTER_GATHER && channel.mode != DmaMode::CYCLIC)
         return -1;
+    if (len == 0) return 0;
 
+    const uint8_t* src = static_cast<const uint8_t*>(data_ptr);
+    uint32_t remaining = len;
+    uint32_t block_size = channel.buffer_size_per_bd;
+    int num_blocks = (len + block_size - 1) / block_size;
+    for (int i = 0; i < num_blocks; ++i) {
+        uint32_t this_block = (remaining > block_size) ? block_size : remaining;
+        bool sof = (i == 0);
+        bool eof = (i == num_blocks - 1);
+        int ret = prepareTransmitBlock(src + i * block_size, this_block, sof, eof);
+        if (ret <= 0) {
+            // Not enough free BDs or error
+            return ret;
+        }
+        remaining -= this_block;
+    }
+    flushTransmit();
+    return num_blocks;
+}
+
+int AxiDmaController::prepareTransmitBlock(const void* data_ptr, uint32_t len, bool sof, bool eof) {
+    DmaChannel& channel = m_mm2s_channel;
+    if (channel.mode != DmaMode::SCATTER_GATHER && channel.mode != DmaMode::CYCLIC)
+        return -1;
     // Check if there is a free BD
     if (channel.bd_chain[channel.head_idx].status & 0x80000000)
         return 0; // No free BDs
-
     // Copy user data to the DMA buffer
-    uint64_t buffer_address_virt = virt_tx_buf + (channel.head_idx * channel.buffer_size_per_bd);
-    uint64_t bd_address_phys = phys_addr_tx_bd + (channel.head_idx * sizeof(AxiDmaBufferDescriptor));
-    void *dma_buffer_virt = (void *)(buffer_address_virt);
+    uint64_t buf_address_virt = virt_tx_buf + (channel.head_idx * channel.buffer_size_per_bd);
+    void* dma_buffer_virt = (void*)(buf_address_virt);
     memcpy(dma_buffer_virt, data_ptr, len);
-
-    // Prepare the BD
-    channel.bd_chain[channel.head_idx].control = (len & 0x07FFFFFF) | (1 << 27) | (1 << 26); // Set length, SOF, EOF
+    // Prepare the BD (set SOF/EOF as requested)
+    uint32_t control = (len & 0x07FFFFFF);
+    if (sof) control |= (1 << 27);
+    if (eof) control |= (1 << 26);
+    channel.bd_chain[channel.head_idx].control = control;
     channel.bd_chain[channel.head_idx].status = 0;
-
     // Advance head pointer
     channel.head_idx = (channel.head_idx + 1) % channel.num_bds;
-
-    // Submit to hardware
-    m_dma_regs[MM2S_CURDESC / 4] = bd_address_phys & 0xFFFFFFFF;
-    m_dma_regs[MM2S_DMACR / 4] = DMA_CR_RUN_STOP_MASK | DMA_CR_IOC_IRQ_EN_MASK | DMA_CR_ERR_IRQ_EN_MASK;
-    m_dma_regs[MM2S_TAILDESC / 4] = bd_address_phys & 0xFFFFFFFF;
-    // std::cout<<std::hex<< m_dma_regs[MM2S_CURDESC / 4]<<std::endl;
-    // std::cout<<std::hex<< m_dma_regs[MM2S_DMACR / 4]<<std::endl;
-    // std::cout<<std::hex<< m_dma_regs[MM2S_TAILDESC / 4]<<std::endl;
-    checkDmaStatus();
-
     return 1;
 }
 
+void AxiDmaController::flushTransmit() {
+    DmaChannel& channel = m_mm2s_channel;
+    if (channel.mode != DmaMode::SCATTER_GATHER && channel.mode != DmaMode::CYCLIC)
+        return;
+    int last_idx = (channel.head_idx + channel.num_bds - 1) % channel.num_bds;
+    uint64_t bd_address_phys = phys_addr_tx_bd + (last_idx * sizeof(AxiDmaBufferDescriptor));
 
-int AxiDmaController::getCompletedBlock(void **data_ptr, uint32_t *len)
+    // Check if DMA is halted (idle)
+    uint32_t status = m_dma_regs[MM2S_DMASR / 4];
+    if (status & DMA_SR_HALTED_MASK) {
+        // Set CURDESC to the first BD in the ring (tail_idx)
+        int first_idx = channel.tail_idx % channel.num_bds;
+        uint64_t first_bd_phys = phys_addr_tx_bd + (first_idx * sizeof(AxiDmaBufferDescriptor));
+        m_dma_regs[MM2S_CURDESC / 4] = first_bd_phys & 0xFFFFFFFF;
+        // Start DMA
+        m_dma_regs[MM2S_DMACR / 4] = DMA_CR_RUN_STOP_MASK | DMA_CR_IOC_IRQ_EN_MASK | DMA_CR_ERR_IRQ_EN_MASK;
+    }
+    // Always update TAILDESC to notify hardware of new BDs
+    m_dma_regs[MM2S_TAILDESC / 4] = bd_address_phys & 0xFFFFFFFF;
+}
+
+int AxiDmaController::sgReceive(void **data_ptr, uint32_t *len)
 {
     DmaDirection dir = DmaDirection::RECEIVE;
     DmaChannel &channel = (dir == DmaDirection::TRANSMIT) ? m_mm2s_channel : m_s2mm_channel;
     if (channel.mode != DmaMode::SCATTER_GATHER && channel.mode != DmaMode::CYCLIC)
-    {
-        std::cout << "[DEBUG] getCompletedBlock: Invalid mode!" << std::endl;
         return -1; // Invalid mode
-    }
-    checkDmaStatus();
+
+    m_dma_regs[S2MM_TAILDESC / 4] = channel.bd_chain_phys_addr + (channel.num_bds - 1) * sizeof(AxiDmaBufferDescriptor);
+    // checkDmaStatus();
 
     // Check if the next BD is already complete
-    std::cout << "[DEBUG] getCompletedBlock: Checking BD status, tail_idx=" << channel.tail_idx << std::endl;
-    std::cout << "[DEBUG] BD status: 0x" << std::hex << channel.bd_chain[channel.tail_idx].status << std::dec << std::endl;
+    // std::cout << "[DEBUG] sgReceive: Checking BD status, tail_idx=" << channel.tail_idx << std::endl;
+    // std::cout << "[DEBUG] BD status: 0x" << std::hex << channel.bd_chain[channel.tail_idx].status << std::dec << std::endl;
     if (!(channel.bd_chain[channel.tail_idx].status & 0x80000000))
     {
-        std::cout << "[DEBUG] BD not complete, waiting for IRQ..." << std::endl;
+        // std::cout << "[DEBUG] BD not complete, waiting for IRQ..." << std::endl;
         uint32_t irq_count;
         ssize_t n = read(m_uio_s2mm_fd, &irq_count, sizeof(irq_count));
     }
 
+    // Advance tail pointer and release
+    // channel.tail_idx = (channel.tail_idx + 1) % channel.num_bds;
     resetIRQ(dir);
 
     if (!(channel.bd_chain[channel.tail_idx].status & 0x80000000))
     {
-        std::cout << "[DEBUG] Still no completed BD after IRQ." << std::endl;
+        // std::cout << "[DEBUG] Still no completed BD after IRQ." << std::endl;
         return 0; // No new block
     }
 
@@ -405,7 +436,40 @@ int AxiDmaController::getCompletedBlock(void **data_ptr, uint32_t *len)
     *data_ptr = (void *)(virt_rx_buf + (channel.tail_idx * channel.buffer_size_per_bd));
     *len = channel.bd_chain[channel.tail_idx].status & 0x03FFFFFF;
 
-    std::cout << "[DEBUG] Completed BD found! len=" << *len << std::endl;
+    // std::cout << "[DEBUG] Completed BD found! len=" << *len << std::endl;
+    return 1; // Success
+}
+
+int AxiDmaController::waitForTransmitCompletionSG() {
+    DmaDirection dir = DmaDirection::TRANSMIT;
+    DmaChannel& channel = m_mm2s_channel;
+    if (channel.mode != DmaMode::SCATTER_GATHER && channel.mode != DmaMode::CYCLIC)
+        return -1; // Invalid mode
+    checkDmaStatus();
+
+    // Check if the next BD is already complete
+    if (!(channel.bd_chain[channel.tail_idx].status & 0x80000000)) {
+        if (WAIT_METHOD == DmaWaitMode::WAIT_POLL) {
+            // Poll until complete
+            while (!(channel.bd_chain[channel.tail_idx].status & 0x80000000)) {
+                // Optionally add a small sleep or yield here
+            }
+        } else {
+            // Wait for IRQ
+            uint32_t irq_count;
+            ssize_t n = read(m_uio_mm2s_fd, &irq_count, sizeof(irq_count));
+            (void)n;
+        }
+    }
+
+    // If still not complete, return 0
+    if (!(channel.bd_chain[channel.tail_idx].status & 0x80000000))
+        return 0;
+
+    // Advance tail pointer
+    channel.tail_idx = (channel.tail_idx + 1) % channel.num_bds;
+    resetIRQ(dir);
+
     return 1; // Success
 }
 

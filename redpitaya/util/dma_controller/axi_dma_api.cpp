@@ -105,7 +105,7 @@ int dma_wait_for_completion(AxiDmaHandle_t handle, DmaDirection_e dir) {
 int dma_get_completed_block(AxiDmaHandle_t handle, DmaDirection_e dir, void** data_ptr, uint32_t* len) {
     if (!handle) return -1;
     try {
-        return handle->getCompletedBlock(data_ptr, len);
+        return handle->sgReceive(data_ptr, len);
     } catch (const std::exception& e) {
         std::cerr << "DMA get block failed: " << e.what() << std::endl;
         return -1;
@@ -122,9 +122,20 @@ void dma_release_completed_block(AxiDmaHandle_t handle, DmaDirection_e dir) {
 int dma_submit_transmit_block(AxiDmaHandle_t handle, const void* data_ptr, uint32_t len) {
     if (!handle) return -1;
     try {
-        return handle->SGTransmitBlock(data_ptr, len);
+        return handle->sgTransmit(data_ptr, len);
     } catch (const std::exception& e) {
         std::cerr << "DMA submit block failed: " << e.what() << std::endl;
+        return -1;
+    }
+}
+
+
+int dma_wait_for_transmit_completion_sg(AxiDmaHandle_t handle) {
+    if (!handle) return -1;
+    try {
+        return handle->waitForTransmitCompletionSG();
+    } catch (const std::exception& e) {
+        std::cerr << "DMA wait for transmit completion SG failed: " << e.what() << std::endl;
         return -1;
     }
 }

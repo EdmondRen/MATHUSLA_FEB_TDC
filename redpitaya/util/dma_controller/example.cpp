@@ -104,30 +104,32 @@ void run_sg_loopback_test() {
     AxiDmaHandle_t dma = dma_create_irq(DMA_PHYS_ADDR, MEM_PHYS_ADDR, MEM_SIZE, UIO_DEVICE_S2MM, UIO_DEVICE_MM2S);
     if (!dma) return;
 
-    const int NUM_BLOCKS = 1;
-    const int BLOCK_SIZE = 4096;
+    const int NUM_BLOCKS = 8;
+    const int BLOCK_SIZE = 8*1024;
 
     // Initialize both channels for SG mode
     dma_init_channel(dma, DMA_MODE_SG, DMA_MODE_SG, NUM_BLOCKS, BLOCK_SIZE);
 
     // Start the receiver first so it's ready for data
+    dma_start(dma, DMA_TRANSMIT);
     dma_start(dma, DMA_RECEIVE);
     std::cout << "Receive channel started." << std::endl;
 
     // Prepare and submit transmit blocks
-    std::vector<uint8_t> test_data(BLOCK_SIZE);
+    int tx_length = BLOCK_SIZE*NUM_BLOCKS;
+    std::vector<uint8_t> test_data(BLOCK_SIZE*NUM_BLOCKS);
     for (int i = 0; i < NUM_BLOCKS; ++i) {
         // Create a unique pattern for each block
         for(int j = 0; j < BLOCK_SIZE; ++j) {
-            test_data[j] = (uint8_t)(i + j);
-        }
-        std::cout << "Submitting transmit block #" << i << std::endl;
-        while (dma_submit_transmit_block(dma, test_data.data(), BLOCK_SIZE) == 0) {
-            // This loop will spin if the DMA transmit ring is full,
-            // which shouldn't happen in this simple test.
-            usleep(1000);
+            test_data[j + i*BLOCK_SIZE] = (uint8_t)(i + j);
         }
     }
+    std::cout << "Submitting transmit blocks" << std::endl;
+    while (dma_submit_transmit_block(dma, test_data.data(), tx_length) == 0) {
+        // This loop will spin if the DMA transmit ring is full,
+        // which shouldn't happen in this simple test.
+        usleep(1000);
+    }    
     std::cout << "Transmit channel started." << std::endl;
 
     // Wait for and verify received blocks
