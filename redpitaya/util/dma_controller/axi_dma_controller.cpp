@@ -289,7 +289,7 @@ void AxiDmaController::setupBdChain(DmaChannel &channel)
         channel.bd_chain[i].buffer_addr_MSB = 0;
         channel.bd_chain[i].reserved3 = 0;
         channel.bd_chain[i].reserved4 = 0;
-        channel.bd_chain[i].control = (channel.buffer_size_per_bd & 0x07FFFFFF); // | (1 << 27) | (1 << 26); // Set length, SOF, EOF
+        channel.bd_chain[i].control = (channel.buffer_size_per_bd & 0x03FFFFFF); // | (1 << 27) | (1 << 26); // Set length, SOF, EOF
         channel.bd_chain[i].status = 0;
         for (int j = 0; j < 5; ++j)
             channel.bd_chain[i].app[j] = 0;
@@ -305,14 +305,16 @@ void AxiDmaController::startSG(DmaDirection dir)
     DmaChannel &channel = (dir == DmaDirection::TRANSMIT) ? m_mm2s_channel : m_s2mm_channel;
     if (channel.mode == DmaMode::SCATTER_GATHER || channel.mode == DmaMode::CYCLIC)
     {
-        std::cout << "[DEBUG] Printing all Buffer Descriptors before starting DMA (dir=" << (dir == DmaDirection::TRANSMIT ? "MM2S" : "S2MM") << ")" << std::endl;
-        for (uint32_t i = 0; i < channel.num_bds; ++i)
-        {
-            const volatile AxiDmaBufferDescriptor &bd = channel.bd_chain[i];
-            std::cout << "  BD[" << i << "] next_desc_ptr=0x" << std::hex << bd.next_desc_ptr
-                      << " buffer_addr=0x" << bd.buffer_addr
-                      << " control=0x" << bd.control
-                      << " status=0x" << bd.status << std::dec << std::endl;
+        if (debug_enabled) {
+            std::cout << "[DEBUG] Printing all Buffer Descriptors before starting DMA (dir=" << (dir == DmaDirection::TRANSMIT ? "MM2S" : "S2MM") << ")" << std::endl;
+            for (uint32_t i = 0; i < channel.num_bds; ++i)
+            {
+                const volatile AxiDmaBufferDescriptor &bd = channel.bd_chain[i];
+                std::cout << "  BD[" << i << "] next_desc_ptr=0x" << std::hex << bd.next_desc_ptr
+                          << " buffer_addr=0x" << bd.buffer_addr
+                          << " control=0x" << bd.control
+                          << " status=0x" << bd.status << std::dec << std::endl;
+            }
         }
         uint32_t cr_offset = (dir == DmaDirection::TRANSMIT) ? MM2S_DMACR : S2MM_DMACR;
         uint32_t curdesc_offset = (dir == DmaDirection::TRANSMIT) ? MM2S_CURDESC : S2MM_CURDESC;
@@ -323,11 +325,14 @@ void AxiDmaController::startSG(DmaDirection dir)
             cr_val |= DMA_CR_CYCLIC_EN_MASK;
         m_dma_regs[curdesc_offset / 4] = channel.bd_chain_phys_addr & 0xFFFFFFFF;
         m_dma_regs[cr_offset / 4] = cr_val;
-        // m_dma_regs[taildesc_offset / 4] = channel.bd_chain_phys_addr + (channel.num_bds - 1) * sizeof(AxiDmaBufferDescriptor);
-        // std::cout<<std::hex<< m_dma_regs[cr_offset / 4]<<std::endl;
-        // std::cout<<std::hex<< m_dma_regs[curdesc_offset / 4]<<","<<std::hex<< (channel.bd_chain_phys_addr & 0xFFFFFFFF)<<std::endl;
-        // std::cout<<std::hex<< m_dma_regs[taildesc_offset / 4]<<std::endl;
-        std::cout << "[DEBUG] Set taildesc (offset 0x" << std::hex << taildesc_offset << ") to 0x" << (channel.bd_chain_phys_addr + (channel.num_bds - 1) * sizeof(AxiDmaBufferDescriptor)) << std::dec << std::endl;
+        if (dir == DmaDirection::RECEIVE)
+            m_dma_regs[taildesc_offset / 4] = channel.bd_chain_phys_addr + (channel.num_bds - 1) * sizeof(AxiDmaBufferDescriptor);
+        if (debug_enabled) {
+            std::cout<<std::hex<< m_dma_regs[cr_offset / 4]<<std::endl;
+            std::cout<<std::hex<< m_dma_regs[curdesc_offset / 4]<<","<<std::hex<< (channel.bd_chain_phys_addr & 0xFFFFFFFF)<<std::endl;
+            std::cout<<std::hex<< m_dma_regs[taildesc_offset / 4]<<std::endl;            
+            std::cout << "[DEBUG] Set taildesc (offset 0x" << std::hex << taildesc_offset << ") to 0x" << (channel.bd_chain_phys_addr + (channel.num_bds - 1) * sizeof(AxiDmaBufferDescriptor)) << std::dec << std::endl;
+        }
     }
 
     checkDmaStatus();
@@ -359,6 +364,39 @@ int AxiDmaController::sgTransmit(const void *data_ptr, uint32_t len) {
     return num_blocks;
 }
 
+int AxiDmaController::waitForTransmitCompletionSG() {
+    DmaDirection dir = DmaDirection::TRANSMIT;
+    DmaChannel& channel = m_mm2s_channel;
+    if (channel.mode != DmaMode::SCATTER_GATHER && channel.mode != DmaMode::CYCLIC)
+        return -1; // Invalid mode
+    checkDmaStatus();
+
+    // Check if the next BD is already complete
+    if (!(channel.bd_chain[channel.tail_idx].status & 0x80000000)) {
+        if (WAIT_METHOD == DmaWaitMode::WAIT_POLL) {
+            // Poll until complete
+            while (!(channel.bd_chain[channel.tail_idx].status & 0x80000000)) {
+                // Optionally add a small sleep or yield here
+            }
+        } else {
+            // Wait for IRQ
+            uint32_t irq_count;
+            ssize_t n = read(m_uio_mm2s_fd, &irq_count, sizeof(irq_count));
+            (void)n;
+        }
+    }
+
+    // If still not complete, return 0
+    if (!(channel.bd_chain[channel.tail_idx].status & 0x80000000))
+        return 0;
+
+    // Advance tail pointer
+    channel.tail_idx = (channel.tail_idx + 1) % channel.num_bds;
+    resetIRQ(dir);
+
+    return 1; // Success
+}
+
 int AxiDmaController::prepareTransmitBlock(const void* data_ptr, uint32_t len, bool sof, bool eof) {
     DmaChannel& channel = m_mm2s_channel;
     if (channel.mode != DmaMode::SCATTER_GATHER && channel.mode != DmaMode::CYCLIC)
@@ -371,7 +409,7 @@ int AxiDmaController::prepareTransmitBlock(const void* data_ptr, uint32_t len, b
     void* dma_buffer_virt = (void*)(buf_address_virt);
     memcpy(dma_buffer_virt, data_ptr, len);
     // Prepare the BD (set SOF/EOF as requested)
-    uint32_t control = (len & 0x07FFFFFF);
+    uint32_t control = (len & 0x03FFFFFF);
     if (sof) control |= (1 << 27);
     if (eof) control |= (1 << 26);
     channel.bd_chain[channel.head_idx].control = control;
@@ -409,8 +447,8 @@ int AxiDmaController::sgReceive(void **data_ptr, uint32_t *len)
     if (channel.mode != DmaMode::SCATTER_GATHER && channel.mode != DmaMode::CYCLIC)
         return -1; // Invalid mode
 
-    m_dma_regs[S2MM_TAILDESC / 4] = channel.bd_chain_phys_addr + (channel.num_bds - 1) * sizeof(AxiDmaBufferDescriptor);
-    // checkDmaStatus();
+    // m_dma_regs[S2MM_TAILDESC / 4] = channel.bd_chain_phys_addr + (channel.num_bds - 1) * sizeof(AxiDmaBufferDescriptor);
+    checkDmaStatus();
 
     // Check if the next BD is already complete
     // std::cout << "[DEBUG] sgReceive: Checking BD status, tail_idx=" << channel.tail_idx << std::endl;
@@ -428,7 +466,7 @@ int AxiDmaController::sgReceive(void **data_ptr, uint32_t *len)
 
     if (!(channel.bd_chain[channel.tail_idx].status & 0x80000000))
     {
-        // std::cout << "[DEBUG] Still no completed BD after IRQ." << std::endl;
+        std::cout << "[DEBUG] Still no completed BD after IRQ." << std::endl;
         return 0; // No new block
     }
 
@@ -440,38 +478,7 @@ int AxiDmaController::sgReceive(void **data_ptr, uint32_t *len)
     return 1; // Success
 }
 
-int AxiDmaController::waitForTransmitCompletionSG() {
-    DmaDirection dir = DmaDirection::TRANSMIT;
-    DmaChannel& channel = m_mm2s_channel;
-    if (channel.mode != DmaMode::SCATTER_GATHER && channel.mode != DmaMode::CYCLIC)
-        return -1; // Invalid mode
-    checkDmaStatus();
 
-    // Check if the next BD is already complete
-    if (!(channel.bd_chain[channel.tail_idx].status & 0x80000000)) {
-        if (WAIT_METHOD == DmaWaitMode::WAIT_POLL) {
-            // Poll until complete
-            while (!(channel.bd_chain[channel.tail_idx].status & 0x80000000)) {
-                // Optionally add a small sleep or yield here
-            }
-        } else {
-            // Wait for IRQ
-            uint32_t irq_count;
-            ssize_t n = read(m_uio_mm2s_fd, &irq_count, sizeof(irq_count));
-            (void)n;
-        }
-    }
-
-    // If still not complete, return 0
-    if (!(channel.bd_chain[channel.tail_idx].status & 0x80000000))
-        return 0;
-
-    // Advance tail pointer
-    channel.tail_idx = (channel.tail_idx + 1) % channel.num_bds;
-    resetIRQ(dir);
-
-    return 1; // Success
-}
 
 void AxiDmaController::releaseBlock(DmaDirection dir)
 {
@@ -482,8 +489,9 @@ void AxiDmaController::releaseBlock(DmaDirection dir)
     channel.bd_chain[channel.tail_idx].status = 0;
     channel.tail_idx = (channel.tail_idx + 1) % channel.num_bds;
 
-    if (channel.mode == DmaMode::SCATTER_GATHER)
+    if (channel.mode == DmaMode::SCATTER_GATHER && dir == DmaDirection::RECEIVE)
     {
+        // Always keep S2MM_TAILDESC at the last BD in the ring
         uint32_t taildesc_offset = (dir == DmaDirection::TRANSMIT) ? MM2S_TAILDESC : S2MM_TAILDESC;
         int new_tail_idx = (channel.tail_idx + channel.num_bds - 1) % channel.num_bds;
         m_dma_regs[taildesc_offset / 4] = channel.bd_chain_phys_addr + new_tail_idx * sizeof(AxiDmaBufferDescriptor);
@@ -525,6 +533,7 @@ void AxiDmaController::checkDmaErrors()
 
 void AxiDmaController::checkDmaStatus()
 {
+    if (!debug_enabled) return;
     uint32_t s2mm_status = m_dma_regs[S2MM_DMASR / 4];
     uint32_t mm2s_status = m_dma_regs[MM2S_DMASR / 4];
     printf("  * Memory-mapped to stream status (0x%08x@0x%02x):\n", mm2s_status, MM2S_DMASR);
@@ -585,4 +594,10 @@ void AxiDmaController::checkDmaStatus()
     if (s2mm_status & 0x00004000)
         printf(" Err_Irq");
     printf("\n");
+}
+
+bool AxiDmaController::debug_enabled = false;
+
+void AxiDmaController::setDebug(bool enable) {
+    debug_enabled = enable;
 }

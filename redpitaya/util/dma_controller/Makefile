@@ -11,37 +11,44 @@
 # //
 # // =================================================================================
 
-# Target executable name
-TARGET = dma_example
-
-# Compiler and flags
+# Target compiler and flags
 CXX = g++
 CXXFLAGS = -std=c++11 -Wall -O2 -pthread
 LDFLAGS = -lstdc++
 
-# Source files
-# This will automatically find all .cpp files in the current directory
-SOURCES = $(wildcard *.cpp)
-# Create a list of object files from the source files
-OBJECTS = $(SOURCES:.cpp=.o)
 
-# Default rule: build the executable
-all: $(TARGET)
+# Sources
+LIBSRCS = axi_dma_api.cpp axi_dma_controller.cpp
+LIBOBJS = $(LIBSRCS:.cpp=.o)
 
-# Rule to link the executable
-$(TARGET): $(OBJECTS)
-	$(CXX) $(OBJECTS) -o $(TARGET) $(LDFLAGS)
+EXAMPLES = example1.cpp example2.cpp
+EXECS = $(EXAMPLES:.cpp=)
+EXOBJS = $(EXAMPLES:.cpp=.o)
 
-# Rule to compile C++ source files into object files
-%.o: %.cpp %.hpp axi_dma_api.h
+# Default target
+all: $(EXECS)
+
+# Build library object files
+$(LIBOBJS): %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Rule to run the example (assumes target has been pushed to the board)
+# Compile example .cpp to .o
+$(EXOBJS): %.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# Link each executable from its .o and the library objects
+$(EXECS): %: %.o $(LIBOBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+# Run target
 run: all
-	./$(TARGET)
+	@if [ -z "$(EX)" ]; then \
+		echo "Usage: make run EX=example1"; \
+		exit 1; \
+	else \
+		./$(EX); \
+	fi
 
-# Rule to clean up the build directory
+# Clean target
 clean:
-	rm -f $(TARGET) $(OBJECTS)
-
-.PHONY: all clean run
+	rm -f $(EXECS) $(LIBOBJS) $(EXOBJS)

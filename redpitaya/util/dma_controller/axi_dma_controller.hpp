@@ -59,15 +59,15 @@ public:
     // Tx and Rx
     int sgTransmit(const void* data_ptr, uint32_t len);
     int sgReceive(void** data_ptr, uint32_t* len);
+    // Release Tx and Rx
     int waitForTransmitCompletionSG();
-
-    // Release
     void releaseBlock(DmaDirection dir);
 
-    // --- SG transmit completion (status only) ---
-
+    // Debug control
+    static void setDebug(bool enable);
 
 private:
+    static bool debug_enabled;
     void waitForCompletion_poll(DmaDirection dir);
     void waitForCompletion_irq(DmaDirection dir);
 

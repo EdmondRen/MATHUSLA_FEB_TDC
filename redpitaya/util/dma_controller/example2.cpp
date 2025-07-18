@@ -15,6 +15,11 @@
 #include <cstring>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <sys/time.h>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 
 // --- Configuration ---
@@ -104,8 +109,8 @@ void run_sg_loopback_test() {
     AxiDmaHandle_t dma = dma_create_irq(DMA_PHYS_ADDR, MEM_PHYS_ADDR, MEM_SIZE, UIO_DEVICE_S2MM, UIO_DEVICE_MM2S);
     if (!dma) return;
 
-    const int NUM_BLOCKS = 8;
-    const int BLOCK_SIZE = 8*1024;
+    const int NUM_BLOCKS = 32;
+    const int BLOCK_SIZE = 32*1024;
 
     // Initialize both channels for SG mode
     dma_init_channel(dma, DMA_MODE_SG, DMA_MODE_SG, NUM_BLOCKS, BLOCK_SIZE);
@@ -125,6 +130,7 @@ void run_sg_loopback_test() {
         }
     }
     std::cout << "Submitting transmit blocks" << std::endl;
+
     while (dma_submit_transmit_block(dma, test_data.data(), tx_length) == 0) {
         // This loop will spin if the DMA transmit ring is full,
         // which shouldn't happen in this simple test.
@@ -132,37 +138,85 @@ void run_sg_loopback_test() {
     }    
     std::cout << "Transmit channel started." << std::endl;
 
-    // Wait for and verify received blocks
+    struct timeval t_start, t_end;
+    gettimeofday(&t_start, NULL);
+
+    // Multi-threaded verification setup
+    std::mutex queue_mutex;
+    std::condition_variable queue_cv;
+    std::queue<std::pair<void*, uint32_t>> block_queue;
     int total_errors = 0;
+    int blocks_processed = 0;
+    bool done_receiving = false;
+    const int NUM_THREADS = std::thread::hardware_concurrency();
+    std::vector<std::thread> workers;
+
+    auto worker = [&]() {
+        while (true) {
+            std::pair<void*, uint32_t> block;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                queue_cv.wait(lock, [&]{ return !block_queue.empty() || done_receiving; });
+                if (block_queue.empty() && done_receiving) return;
+                block = block_queue.front();
+                block_queue.pop();
+            }
+            // Verify data (same as before)
+            bool ok = true;
+            uint8_t* rx_data = static_cast<uint8_t*>(block.first);
+            uint32_t len = block.second;
+            int local_errors = 0;
+            int block_idx = (rx_data[0] & 0xFF); // pattern: i + j, so first byte is i
+            for(uint32_t j = 0; j < len; ++j) {
+                if (rx_data[j] != (uint8_t)(block_idx + j)) {
+                    ok = false;
+                    local_errors++;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                total_errors += local_errors;
+                blocks_processed++;
+            }
+        }
+    };
+
+    // Launch worker threads
+    for (int t = 0; t < NUM_THREADS; ++t) {
+        workers.emplace_back(worker);
+    }
+
+    // Main thread: receive blocks and dispatch to workers
     for (int i = 0; i < NUM_BLOCKS; ++i) {
         void* data_ptr = nullptr;
         uint32_t len = 0;
         int result = dma_get_completed_block(dma, DMA_RECEIVE, &data_ptr, &len);
-
         if (result > 0) {
-            std::cout << "Received block #" << i << " with length " << len << std::endl;
-            // Verify data
-            bool ok = true;
-            uint8_t* rx_data = static_cast<uint8_t*>(data_ptr);
-            for(uint32_t j = 0; j < len; ++j) {
-                if (rx_data[j] != (uint8_t)(i + j)) {
-                    ok = false;
-                    total_errors++;
-                    // printf("* Error: [%d]: Tx %d, Rx %d*\n",j, (i+j) & 0xFF, rx_data[j]);
-                }
-                else{
-                    // printf("* Correct: [%d]: Tx %d, Rx %d*\n",j, (i+j) & 0xFF, rx_data[j]);
-                }
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                block_queue.emplace(data_ptr, len);
             }
-            std::cout << "  Verification: " << (ok ? "PASS" : "FAIL")<< ", total errors "<< total_errors << std::endl;
-
+            queue_cv.notify_one();
             dma_release_completed_block(dma, DMA_RECEIVE);
         } else {
             std::cerr << "Error receiving block." << std::endl;
-            total_errors++;
             break;
         }
     }
+    // Signal workers to finish
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        done_receiving = true;
+    }
+    queue_cv.notify_all();
+    for (auto& t : workers) t.join();
+
+    gettimeofday(&t_end, NULL);
+    double elapsed = (t_end.tv_sec - t_start.tv_sec) + (t_end.tv_usec - t_start.tv_usec) / 1e6;
+    double mb = tx_length / (1024.0 * 1024.0);
+    double mbps = mb / elapsed;
+    std::cout << "\nDMA transfer time: " << elapsed << " s, throughput: " << mbps << " MB/s" << std::endl;
+    std::cout << "Blocks processed: " << blocks_processed << ", total errors: " << total_errors << std::endl;
     
     if (total_errors == 0) {
         std::cout << "\n*** SG Test SUCCESS ***" << std::endl;
